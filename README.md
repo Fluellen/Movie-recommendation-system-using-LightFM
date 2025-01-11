@@ -4,3 +4,5 @@ The goal of the project is to create a movie recommendation system using the Lig
 ![image](https://github.com/user-attachments/assets/a9d6e241-9aa7-4912-9e9c-06bc033bf069)
 
 ![image](https://github.com/user-attachments/assets/087a8bfd-e18b-4aaf-aef9-aa4d30d6f39d)
+
+This product uses the TMDB API but is not endorsed or certified by TMDB.
