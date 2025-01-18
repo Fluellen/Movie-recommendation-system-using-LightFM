@@ -1,18 +1,21 @@
 import traceback
 import psutil
+import scipy
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
+import joblib
+import logging
+import os
+from scipy import sparse
 from lightfm import LightFM
 from lightfm.data import Dataset
 from lightfm.evaluation import precision_at_k, auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from textblob import TextBlob
-import logging
-import os
 from typing import Tuple, List, Dict
 from tqdm.auto import tqdm
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -52,6 +55,7 @@ def load_and_preprocess_data():
         imdb_reviews = pd.read_csv('imdb/imdb_reviews.csv', encoding='windows-1252')
         
         # Merge datasets
+        logger.info("Merging datasets...")
         ratings_combined = pd.concat([ratings_32m, ratings_1m], ignore_index=True)
         # Group by userId and movieId, then aggregate
         ratings = ratings_combined.groupby(['userId', 'movieId']).agg({
@@ -59,6 +63,18 @@ def load_and_preprocess_data():
             'timestamp': 'max',  # Take the most recent timestamp
             'source': lambda x: '|'.join(set(x))  # Join the sources
         }).reset_index()
+        # # Identify ratings outside the valid range
+        # invalid_ratings = ratings[(ratings['rating'] < 1) | (ratings['rating'] > 5)].copy()
+
+        # # Add columns to show original ratings from each source
+        # invalid_ratings['32m_rating'] = invalid_ratings.apply(lambda row: ratings_32m[(ratings_32m['userId'] == row['userId']) & (ratings_32m['movieId'] == row['movieId'])]['rating'].values[0] if '32m' in row['source'] else None, axis=1)
+        # invalid_ratings['1m_rating'] = invalid_ratings.apply(lambda row: ratings_1m[(ratings_1m['userId'] == row['userId']) & (ratings_1m['movieId'] == row['movieId'])]['rating'].values[0] if '1m' in row['source'] else None, axis=1)
+
+        # # Export invalid ratings to CSV
+        # logger.info("Saving invalid ratings to 'invalid_ratings.csv'...")
+        # invalid_ratings.to_csv('invalid_ratings.csv', index=False)
+        # logger.info(f"Exported {len(invalid_ratings)} invalid ratings to 'invalid_ratings.csv'")
+
         movies = movies_32m
         users = users_1m
       
@@ -188,6 +204,66 @@ def get_age_group(age):
     else:
         return 56
 
+def validate_interactions(interactions):
+    logger.info("Detailed interaction matrix validation:")
+    logger.info(f"Shape: {interactions.shape}")
+    logger.info(f"Type: {type(interactions)}")
+    logger.info(f"Data type of values: {interactions.dtype}")
+    logger.info(f"Non-zero elements: {interactions.nnz}")
+    logger.info(f"Density: {interactions.nnz / (interactions.shape[0] * interactions.shape[1]):.4%}")
+    logger.info(f"Value range: min={interactions.data.min():.2f}, max={interactions.data.max():.2f}")
+
+    # Memory check
+    matrix_size = (interactions.data.nbytes + interactions.indptr.nbytes + 
+                  interactions.indices.nbytes) / 1024 / 1024
+    logger.info(f"Matrix memory usage: {matrix_size:.2f} MB")
+    
+    if not isinstance(interactions, scipy.sparse.csr_matrix):
+        raise ValueError("Interactions must be a CSR matrix")
+    if np.isnan(interactions.data).any():
+        raise ValueError("Interactions contain NaN values")
+    
+    return True
+
+def train_model_with_progress(model, interactions, name, **kwargs):
+    """Helper function to train a single model with progress tracking"""
+    logger.info(f"Starting {name} training with interactions shape: {interactions.shape}")
+    validate_interactions(interactions)
+
+    model = LightFM(
+        loss='logistic',
+        no_components=64, 
+        learning_rate=0.05,
+        item_alpha=1e-6,
+        user_alpha=1e-6,
+        max_sampled=10 
+    )
+    
+    try:
+        batch_size = interactions.shape[0] // 4
+        for epoch in range(30):
+            logger.info(f"{name}: Starting epoch {epoch}/30")
+            for start_idx in range(0, interactions.shape[0], batch_size):
+                end_idx = min(start_idx + batch_size, interactions.shape[0])
+                batch = interactions[start_idx:end_idx]
+
+                model.fit_partial(
+                    interactions,
+                    epochs=1,
+                    verbose=True,
+                    **kwargs
+                )
+
+            if epoch % 5 == 0:
+                logger.info(f"{name}: Completed epoch {epoch}/30")
+        
+        logger.info(f"{name}: Training completed successfully")
+        return model
+    
+    except Exception as e:
+        logger.error(f"{name}: Training failed - {str(e)}")
+        raise
+
 # Train models
 def train_models(ratings, user_features, item_features, imdb_user_features):
     try:
@@ -212,6 +288,9 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         dataset = Dataset()
         
         all_item_ids = set(ratings['movieId'].unique()) | set(item_features.index)
+
+        logger.info(f"Number of unique users: {len(all_item_ids)}")
+        logger.info(f"Number of unique items: {len(ratings['userId'].unique())}")
 
         # Fit the dataset first
         logger.info("Fitting user and item IDs...")
@@ -276,21 +355,34 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         
         # Train models
         models = {
-            'model_32m': LightFM(loss='warp'),
-            'model_1m': LightFM(loss='warp'),
-            'model_imdb': LightFM(loss='warp')
+            'model_32m': LightFM(loss='logistic'),
+            'model_1m': LightFM(loss='logistic'),
+            'model_imdb': LightFM(loss='logistic')
         }
 
         for name, model in models.items():
             logger.info(f"Training {name}...")
             try:
                 if name == 'model_32m':
-                    model.fit(train_interactions, epochs=30, num_threads=4)
+                    models[name] = train_model_with_progress(
+                        model,
+                        train_interactions,
+                        name
+                    )
                 elif name == 'model_1m':
-                    model.fit(train_interactions, user_features=user_features_matrix, epochs=30, num_threads=4)
+                    models[name] = train_model_with_progress(
+                        model,
+                        train_interactions,
+                        name,
+                        user_features=user_features_matrix
+                    )
                 else:  # model_imdb
-                    model.fit(train_interactions, item_features=item_features_matrix, epochs=30, num_threads=4)
-                logger.info(f"Completed training {name}")
+                    models[name] = train_model_with_progress(
+                        model,
+                        train_interactions,
+                        name,
+                        item_features=item_features_matrix
+                    )
             except Exception as e:
                 logger.error(f"Failed to train {name}: {str(e)}")
                 raise
@@ -298,17 +390,32 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         logger.info("All models trained successfully")
         return models['model_32m'], models['model_1m'], models['model_imdb'], dataset, test_interactions
 
-        # model_32m = LightFM(loss='warp')
-        # model_32m.fit(train_interactions, epochs=30, num_threads=4)
+        # logger.info("Training model_32m...")
+        # validate_interactions(train_interactions)
+        # model_32m = train_model_with_progress(
+        #     LightFM(loss='warp'),
+        #     train_interactions,
+        #     "model_32m"
+        # )
         
-        # model_1m = LightFM(loss='warp')
-        # model_1m.fit(train_interactions, user_features=user_features_matrix, epochs=30, num_threads=4)
+        # logger.info("Training model_1m...")
+        # model_1m = train_model_with_progress(
+        #     LightFM(loss='warp'),
+        #     train_interactions,
+        #     "model_1m",
+        #     user_features=user_features_matrix
+        # )
         
-        # model_imdb = LightFM(loss='warp')
-        # model_imdb.fit(train_interactions, item_features=item_features_matrix, epochs=30, num_threads=4)
-  
-        logger.info("Successfully trained all models")
-        return model_32m, model_1m, model_imdb, dataset, test_interactions
+        # logger.info("Training model_imdb...")
+        # model_imdb = train_model_with_progress(
+        #     LightFM(loss='warp'),
+        #     train_interactions,
+        #     "model_imdb",
+        #     item_features=item_features_matrix
+        # )
+
+        #logger.info("All models trained successfully")
+        #return model_32m, model_1m, model_imdb, dataset, test_interactions
         
     except Exception as e:
         logger.error(f"Error in train_models: {str(e)}")
