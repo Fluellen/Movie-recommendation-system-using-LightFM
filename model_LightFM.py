@@ -202,7 +202,10 @@ def create_user_features(users):
         }
         user_features = pd.concat([user_features, pd.get_dummies(users['age'].map(age_groups), prefix='age')], axis=1)
         logger.info(f"Created user features with shape: {user_features.shape}")
+        logger.info("User Features Head:\n%s", user_features.head())
         return user_features.set_index(users['userId'])  
+
+        
         
     except Exception as e:
         logger.error(f"Error creating user features: {str(e)}")
@@ -223,19 +226,40 @@ def create_imdb_user_features(imdb_reviews):
     # Normalize review count
     max_review_count = imdb_user_features['review_count'].max()
     imdb_user_features['normalized_review_count'] = imdb_user_features['review_count'] / (max_review_count if max_review_count > 0 else 1)
+
+    logger.info("IMDb User Features Head:\n%s", imdb_user_features.head())
     
     return imdb_user_features.set_index('User')
 
 # Create item features
 def create_item_features(movies, imdb_reviews):
+    
+    # Log initial size
+    logger.info(f"Initial movies shape: {movies.shape}")
+
     # Genre features
     genre_features = movies['genres'].str.get_dummies(sep='|')
+    logger.info(f"Genre features shape: {genre_features.shape}")
 
     try:
         # Calculate film age
         current_year = datetime.now().year
-        movies['release_year'] = pd.to_datetime(movies['release_year']).dt.year
+        movies['release_date'] = pd.to_datetime(movies['release_date'], format='%Y-%m-%d', errors='coerce')
+        movies['release_year'] = movies['release_date'].dt.year
+
+        # Store original index
+        original_index = movies.index
+
+        # Calculate film age
         movies['film_age'] = current_year - movies['release_year']
+        movies['film_age'] = movies['film_age'].fillna(movies['film_age'].median())
+        logger.info(f"Movies shape after date processing: {movies.shape}")
+
+        # Drop rows where release_date couldn't be parsed
+        # invalid_dates = movies['release_year'].isna().sum()
+        # if invalid_dates > 0:
+        #     logger.warning(f"Dropping {invalid_dates} movies with invalid release dates")
+        #     movies = movies.dropna(subset=['release_year'])
 
         # Validate conversion
         logger.info(f"Release year range: {movies['release_year'].min()} - {movies['release_year'].max()}")
@@ -281,11 +305,13 @@ def create_item_features(movies, imdb_reviews):
     scaler = StandardScaler()
     movies[numerical_features] = scaler.fit_transform(movies[numerical_features])
 
+    # Log shapes before merge
+    logger.info(f"Movies before IMDb merge: {len(movies)}")
+    logger.info(f"IMDb features before merge: {len(imdb_movie_features)}")
+
     # Merge IMDb features with movies
-    logger.info(f"Movies before merge: {len(movies)}")
     movies_with_imdb = movies.merge(imdb_movie_features, on='imdb_id', how='left')
     logger.info(f"Movies after merge: {len(movies_with_imdb)}")
-    logger.info(f"Movies with IMDb features: {movies['imdb_avg_sentiment'].notna().sum()}")
 
     # Fill NaN values for movies without IMDb reviews
     for col in ['imdb_avg_sentiment', 'imdb_sentiment_std', 'imdb_review_count']:
@@ -300,14 +326,17 @@ def create_item_features(movies, imdb_reviews):
         genre_features, 
         movies_with_imdb[numerical_features + ['film_age', 'imdb_avg_sentiment', 'imdb_sentiment_std', 'normalized_imdb_review_count']]
     ], axis=1)
-
-    # Ensure all movies are included and set index to movieId
-    item_features = item_features.reindex(movies['movieId'])
     
     # Fill any remaining NaN values with 0
     item_features = item_features.fillna(0)
 
-    return item_features.set_index(movies['movieId'])
+    logger.info("Item Features Head:\n%s", item_features.head())
+
+    # Ensure alignment with original movies
+    item_features = item_features.reindex(index=movies.index)
+    logger.info(f"Final item_features shape: {item_features.shape}")
+
+    return item_features
 
 def get_age_group(age):
     if age < 18:
@@ -471,15 +500,28 @@ def train_models(ratings, user_features, item_features, n_folds=5):
         # Prepare user features
         logger.info("Building user features...")
         try:
+            # Convert user features to float32 for consistency
+            user_features = user_features.astype(np.float32)
+            
+            # Create user feature list with explicit dtype handling
             user_feature_list = [
-                (uid, {feature: value for feature, value in row.items() if pd.notnull(value) and value != 0})
+                (uid, {
+                    feature: float(value) 
+                    for feature, value in row.items() 
+                    if pd.notnull(value) and value != 0
+                })
                 for uid, row in user_features.iterrows()
             ]
+            
+            # Build user features with explicit dtype
             user_features_matrix = dataset.build_user_features(user_feature_list)
+            
             logger.info(f"Built user features with shape: {user_features_matrix.shape}")
+            logger.info(f"User features dtype: {user_features_matrix.dtype}")
         except Exception as e:
             logger.error(f"Failed to build user features: {str(e)}")
             raise
+        
         # user_feature_list = [
         #     (uid, {feature: value for feature, value in row.items() if value != 0})
         #     for uid, row in user_features.iterrows()
@@ -498,6 +540,7 @@ def train_models(ratings, user_features, item_features, n_folds=5):
         except Exception as e:
             logger.error(f"Failed to build item features: {str(e)}")
             raise
+
         # item_feature_list = [
         #     (iid, {feature: value for feature, value in row.items() if value != 0})
         #     for iid, row in item_features.iterrows()
@@ -510,14 +553,21 @@ def train_models(ratings, user_features, item_features, n_folds=5):
 
         # Perform k-fold cross-validation
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
-        fold_indices = kf.split(np.arange(interactions.shape[0]))
+        fold_indices = kf.split(range(interactions.shape[0]))
 
         for fold, (train_idx, test_idx) in enumerate(fold_indices):
             logger.info(f"Training fold {fold+1}/{n_folds}")
 
-            # Split interactions
-            train = interactions[train_idx]
-            test = interactions[test_idx] 
+            # Convert to csr_matrix format and properly slice the sparse matrix
+            train = sparse.csr_matrix((
+                interactions.data[train_idx],
+                (interactions.row[train_idx], interactions.col[train_idx])
+            ), shape=interactions.shape)
+
+            test = sparse.csr_matrix((
+                interactions.data[test_idx],
+                (interactions.row[test_idx], interactions.col[test_idx])
+            ), shape=interactions.shape)
 
             # Train base model
             base_model = LightFM(
