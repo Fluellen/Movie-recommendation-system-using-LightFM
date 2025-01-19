@@ -12,10 +12,66 @@ from lightfm.data import Dataset
 from lightfm.evaluation import precision_at_k, auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
 from textblob import TextBlob
 from typing import Tuple, List, Dict
 from tqdm.auto import tqdm
 from datetime import datetime
+
+# Save trained models and associated data
+def save_models(models, dataset, test_interactions):
+    save_dir = 'trained_models'
+    os.makedirs(save_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Save each model and dataset
+    model_files = {
+        'model_base': f'{save_dir}/model_base_{timestamp}.joblib',
+        'model_user': f'{save_dir}/model_user_{timestamp}.joblib',
+        'dataset': f'{save_dir}/dataset_{timestamp}.joblib',
+        'test_interactions': f'{save_dir}/test_interactions_{timestamp}.joblib'
+    }
+    
+    joblib.dump(models['model_base'], model_files['model_base'])
+    joblib.dump(models['model_user'], model_files['model_user'])
+    joblib.dump(dataset, model_files['dataset'])
+    joblib.dump(test_interactions, model_files['test_interactions'])
+    
+    # Save metadata
+    with open(f'{save_dir}/model_info_{timestamp}.txt', 'w') as f:
+        f.write(f"Models saved on: {timestamp}\n")
+        for name, path in model_files.items():
+            f.write(f"{name}: {path}\n")
+    
+    return model_files
+
+# Load most recent trained models
+def load_latest_models():
+    save_dir = 'trained_models'
+    if not os.path.exists(save_dir):
+        return None, None, None, None
+    
+    # Find latest timestamp
+    timestamps = []
+    for file in os.listdir(save_dir):
+        if file.startswith('model_base_'):
+            timestamp = file.split('_')[2].split('.')[0]
+            timestamps.append(timestamp)
+    
+    if not timestamps:
+        return None, None, None, None
+    
+    latest = max(timestamps)
+    
+    # Load models
+    model_base = joblib.load(f'{save_dir}/model_base_{latest}.joblib')
+    model_user = joblib.load(f'{save_dir}/model_user_{latest}.joblib')
+    dataset = joblib.load(f'{save_dir}/dataset_{latest}.joblib')
+    test_interactions = joblib.load(f'{save_dir}/test_interactions_{latest}.joblib')
+    
+    return model_base, model_user, dataset, test_interactions
 
 # Configure logging
 logging.basicConfig(
@@ -44,7 +100,7 @@ def load_and_preprocess_data():
         # Load MovieLens 32M dataset
         ratings_32m = pd.read_csv('ml-32m/ratings.csv', encoding='iso-8859-1')
         ratings_32m['source'] = '32m'
-        movies_32m = pd.read_csv('ml-32m/movies.csv', encoding='iso-8859-1')
+        movies_32m = pd.read_csv('ml-32m/movies_v2.csv', encoding='iso-8859-1')
         
         # Load MovieLens 1M dataset
         ratings_1m = pd.read_csv('ml-1m/ratings.csv', encoding='windows-1252')
@@ -115,7 +171,7 @@ def create_user_features(users):
     try:
         logger.info("Creating user features...")
         # Demographic features
-        user_features = pd.get_dummies(users[['gender', 'occupation']])
+        user_features = pd.get_dummies(users[['gender', 'occupation']], sparse=True)
         
         # Handle age groups
         age_groups = {
@@ -140,46 +196,94 @@ def create_imdb_user_features(imdb_reviews):
     imdb_reviews['sentiment'] = imdb_reviews['Review'].apply(lambda x: TextBlob(x).sentiment.polarity)
     
     # Aggregate user features
-    user_features = imdb_reviews.groupby('User').agg({
+    imdb_user_features = imdb_reviews.groupby('User').agg({
         'sentiment': ['mean', 'std'],
         'Review': 'count'
     }).reset_index()
     
-    user_features.columns = ['User', 'avg_sentiment', 'sentiment_std', 'review_count']
+    imdb_user_features.columns = ['User', 'avg_sentiment', 'sentiment_std', 'review_count']
     
     # Normalize review count
-    max_review_count = user_features['review_count'].max()
-    user_features['normalized_review_count'] = user_features['review_count'] / max_review_count
+    max_review_count = imdb_user_features['review_count'].max()
+    imdb_user_features['normalized_review_count'] = imdb_user_features['review_count'] / (max_review_count if max_review_count > 0 else 1)
     
-    return user_features
+    return imdb_user_features.set_index('User')
 
 # Create item features
 def create_item_features(movies, imdb_reviews):
     # Genre features
     genre_features = movies['genres'].str.get_dummies(sep='|')
 
-    # Aggregate review sentiment per movie
+    try:
+        # Calculate film age
+        current_year = datetime.now().year
+        movies['release_year'] = pd.to_datetime(movies['release_year']).dt.year
+        movies['film_age'] = current_year - movies['release_year']
+
+        # Validate conversion
+        logger.info(f"Release year range: {movies['release_year'].min()} - {movies['release_year'].max()}")
+        logger.info(f"Film age range: {movies['film_age'].min()} - {movies['film_age'].max()}")
+
+        if movies['release_year'].isna().any():
+            logger.warning(f"Found {movies['release_year'].isna().sum()} movies with missing release years")
+            # Fill missing years with median
+            median_year = movies['release_year'].median()
+            movies['release_year'] = movies['release_year'].fillna(median_year)
+            movies['film_age'] = movies['film_age'].fillna(current_year - median_year)
+    
+    except Exception as e:
+        logger.error(f"Error processing release dates: {str(e)}")
+        raise
+    
+    # Normalize film age
+    #movies['film_age'] = (movies['film_age'] - movies['film_age'].min()) / (movies['film_age'].max() - movies['film_age'].min())
+    
+    # Add IMDb review information
     imdb_reviews['sentiment'] = imdb_reviews['Review'].apply(lambda x: TextBlob(str(x)).sentiment.polarity)
-    movie_sentiments = imdb_reviews.groupby('Movie')['sentiment'].agg(['mean', 'count']).reset_index()
-    movie_sentiments.columns = ['title', 'avg_sentiment', 'review_count']
+    imdb_reviews = imdb_reviews.rename(columns={'imdbId': 'imdb_id'})
+    imdb_movie_features = imdb_reviews.groupby('imdb_id').agg({
+        'sentiment': ['mean', 'std'],
+        'Review': 'count'
+    }).reset_index()
+    imdb_movie_features.columns = ['imdb_id', 'imdb_avg_sentiment', 'imdb_sentiment_std', 'imdb_review_count']
+
+    # Handle numerical features
+    numerical_features = ['vote_average', 'vote_count', 'runtime', 'revenue', 'budget', 'popularity', 'film_age']
     
-    # Merge sentiment data with movies, keeping all movies
-    movies_with_sentiments = movies.merge(movie_sentiments, on='title', how='left')
-    
-    # Fill NaN values for movies without reviews
-    movies_with_sentiments['avg_sentiment'] = movies_with_sentiments['avg_sentiment'].fillna(0)
-    movies_with_sentiments['review_count'] = movies_with_sentiments['review_count'].fillna(0)
-    
-    # Normalize review count
-    max_review_count = movies_with_sentiments['review_count'].max()
-    movies_with_sentiments['normalized_review_count'] = movies_with_sentiments['review_count'] / (max_review_count if max_review_count > 0 else 1)
+    # Fill missing values
+    for feature in numerical_features:
+        movies[feature] = movies[feature].fillna(movies[feature].median())
+
+    # Handle outliers using winsorization
+    def winsorize(s, limits=(0.05, 0.95)):
+        return s.clip(s.quantile(limits[0]), s.quantile(limits[1]))
+    for feature in numerical_features:
+        movies[feature] = winsorize(movies[feature])
+
+    # Normalize numerical features
+    scaler = StandardScaler()
+    movies[numerical_features] = scaler.fit_transform(movies[numerical_features])
+
+    # Merge IMDb features with movies
+    logger.info(f"Movies before merge: {len(movies)}")
+    movies_with_imdb = movies.merge(imdb_movie_features, on='imdb_id', how='left')
+    logger.info(f"Movies after merge: {len(movies_with_imdb)}")
+    logger.info(f"Movies with IMDb features: {movies['imdb_avg_sentiment'].notna().sum()}")
+
+    # Fill NaN values for movies without IMDb reviews
+    for col in ['imdb_avg_sentiment', 'imdb_sentiment_std', 'imdb_review_count']:
+        movies_with_imdb[col] = movies_with_imdb[col].fillna(0)
+
+    # Normalize IMDb review count
+    max_review_count = movies_with_imdb['imdb_review_count'].max()
+    movies_with_imdb['normalized_imdb_review_count'] = movies_with_imdb['imdb_review_count'] / (max_review_count if max_review_count > 0 else 1)
     
     # Combine all features
     item_features = pd.concat([
         genre_features, 
-        movies_with_sentiments[['avg_sentiment', 'normalized_review_count']]
+        movies_with_imdb[numerical_features + ['film_age', 'imdb_avg_sentiment', 'imdb_sentiment_std', 'normalized_imdb_review_count']]
     ], axis=1)
-    
+
     # Ensure all movies are included and set index to movieId
     item_features = item_features.reindex(movies['movieId'])
     
@@ -225,18 +329,41 @@ def validate_interactions(interactions):
     
     return True
 
+# Train new models or load existing ones
+def train_or_load_models(ratings, user_features, item_features, imdb_user_features, force_retrain=False):
+    if not force_retrain:
+        logger.info("Attempting to load existing models...")
+        models = load_latest_models()
+        if all(model is not None for model in models):
+            logger.info("Successfully loaded existing models")
+            return models
+    
+    logger.info("Training new models...")
+    models = train_models(ratings, user_features, item_features)
+    
+    # Save newly trained models
+    model_dict = {
+        'model_base': models[0],
+        'model_user': models[1]
+    }
+    save_models(model_dict, models[2], models[3])
+    
+    return models
+
 def train_model_with_progress(model, interactions, name, **kwargs):
     """Helper function to train a single model with progress tracking"""
     logger.info(f"Starting {name} training with interactions shape: {interactions.shape}")
     validate_interactions(interactions)
 
     model = LightFM(
-        loss='logistic',
+        loss='warp',
         no_components=64, 
         learning_rate=0.05,
         item_alpha=1e-6,
         user_alpha=1e-6,
-        max_sampled=10 
+        max_sampled=10,
+        learning_schedule='adagrad',
+        num_threads=4
     )
     
     try:
@@ -265,7 +392,7 @@ def train_model_with_progress(model, interactions, name, **kwargs):
         raise
 
 # Train models
-def train_models(ratings, user_features, item_features, imdb_user_features):
+def train_models(ratings, user_features, item_features):
     try:
         logger.info("Training recommendation models...")
 
@@ -304,7 +431,7 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         # Build interactions
         logger.info("Building interactions...")
         try:
-            interactions, weights = dataset.build_interactions(ratings[['userId', 'movieId', 'rating']].values)
+            (interactions, weights) = dataset.build_interactions(ratings[['userId', 'movieId', 'rating']].values)
             logger.info(f"Built interactions with shape: {interactions.shape}")
             logger.info(f"Number of non-zero entries: {interactions.nnz}")
             logger.info(f"Density of interactions matrix: {interactions.nnz / (interactions.shape[0] * interactions.shape[1]):.4%}")
@@ -317,7 +444,7 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         logger.info("Building user features...")
         try:
             user_feature_list = [
-                (uid, {feature: value for feature, value in row.items() if pd.notnull(value)})
+                (uid, {feature: value for feature, value in row.items() if pd.notnull(value) and value != 0})
                 for uid, row in user_features.iterrows()
             ]
             user_features_matrix = dataset.build_user_features(user_feature_list)
@@ -335,7 +462,7 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         logger.info("Building item features...")
         try:
             item_feature_list = [
-                (iid, {feature: value for feature, value in row.items() if pd.notnull(value)})
+                (iid, {feature: value for feature, value in row.items() if pd.notnull(value) and value != 0})
                 for iid, row in item_features.iterrows()
             ]
             item_features_matrix = dataset.build_item_features(item_feature_list)
@@ -355,40 +482,34 @@ def train_models(ratings, user_features, item_features, imdb_user_features):
         
         # Train models
         models = {
-            'model_32m': LightFM(loss='logistic'),
-            'model_1m': LightFM(loss='logistic'),
-            'model_imdb': LightFM(loss='logistic')
+            'model_base': LightFM(loss='warp', random_state=42),
+            'model_user': LightFM(loss='warp', random_state=42)
         }
 
         for name, model in models.items():
             logger.info(f"Training {name}...")
             try:
-                if name == 'model_32m':
-                    models[name] = train_model_with_progress(
-                        model,
-                        train_interactions,
-                        name
-                    )
-                elif name == 'model_1m':
+                if name == 'model_base':
                     models[name] = train_model_with_progress(
                         model,
                         train_interactions,
                         name,
-                        user_features=user_features_matrix
+                        item_features=item_features_matrix,
                     )
-                else:  # model_imdb
+                else:  # model_user
                     models[name] = train_model_with_progress(
                         model,
                         train_interactions,
                         name,
-                        item_features=item_features_matrix
+                        user_features=user_features_matrix,
+                        item_features=item_features_matrix                        
                     )
             except Exception as e:
                 logger.error(f"Failed to train {name}: {str(e)}")
                 raise
 
         logger.info("All models trained successfully")
-        return models['model_32m'], models['model_1m'], models['model_imdb'], dataset, test_interactions
+        return models['model_base'], models['model_user'], dataset, test_interactions
 
         # logger.info("Training model_32m...")
         # validate_interactions(train_interactions)
@@ -531,7 +652,7 @@ def main():
         
         # Create features
         user_features = create_user_features(users)
-        imdb_user_features = create_imdb_user_features(imdb_reviews)
+        #imdb_user_features = create_imdb_user_features(imdb_reviews)
         item_features = create_item_features(movies, imdb_reviews)
         
         # Check for NaN values
@@ -551,8 +672,13 @@ def main():
             raise ValueError("All ratings must be between 1 and 5")
         
         # Train models
-        model_32m, model_1m, model_imdb, dataset, test_interactions = train_models(ratings, user_features, item_features, imdb_user_features)
-        
+        #model_32m, model_1m, model_imdb, dataset, test_interactions = train_models(ratings, user_features, item_features, imdb_user_features)
+        model_base, model_user, dataset, test_interactions = train_or_load_models(
+            ratings, 
+            user_features, 
+            item_features,
+            force_retrain=False  # Set to True to force retraining
+        )
         # Example: Generate recommendations for a new user
         new_user_age = 30
         new_user_gender = 'M'
