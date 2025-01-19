@@ -136,17 +136,6 @@ def load_and_preprocess_data():
             'timestamp': 'max',  # Take the most recent timestamp
             'source': lambda x: '|'.join(set(x))  # Join the sources
         }).reset_index()
-        # # Identify ratings outside the valid range
-        # invalid_ratings = ratings[(ratings['rating'] < 1) | (ratings['rating'] > 5)].copy()
-
-        # # Add columns to show original ratings from each source
-        # invalid_ratings['32m_rating'] = invalid_ratings.apply(lambda row: ratings_32m[(ratings_32m['userId'] == row['userId']) & (ratings_32m['movieId'] == row['movieId'])]['rating'].values[0] if '32m' in row['source'] else None, axis=1)
-        # invalid_ratings['1m_rating'] = invalid_ratings.apply(lambda row: ratings_1m[(ratings_1m['userId'] == row['userId']) & (ratings_1m['movieId'] == row['movieId'])]['rating'].values[0] if '1m' in row['source'] else None, axis=1)
-
-        # # Export invalid ratings to CSV
-        # logger.info("Saving invalid ratings to 'invalid_ratings.csv'...")
-        # invalid_ratings.to_csv('invalid_ratings.csv', index=False)
-        # logger.info(f"Exported {len(invalid_ratings)} invalid ratings to 'invalid_ratings.csv'")
 
         movies = movies_32m
         users = users_1m
@@ -203,9 +192,7 @@ def create_user_features(users):
         user_features = pd.concat([user_features, pd.get_dummies(users['age'].map(age_groups), prefix='age')], axis=1)
         logger.info(f"Created user features with shape: {user_features.shape}")
         logger.info("User Features Head:\n%s", user_features.head())
-        return user_features.set_index(users['userId'])  
-
-        
+        return user_features.set_index(users['userId'])        
         
     except Exception as e:
         logger.error(f"Error creating user features: {str(e)}")
@@ -254,12 +241,6 @@ def create_item_features(movies, imdb_reviews):
         movies['film_age'] = current_year - movies['release_year']
         movies['film_age'] = movies['film_age'].fillna(movies['film_age'].median())
         logger.info(f"Movies shape after date processing: {movies.shape}")
-
-        # Drop rows where release_date couldn't be parsed
-        # invalid_dates = movies['release_year'].isna().sum()
-        # if invalid_dates > 0:
-        #     logger.warning(f"Dropping {invalid_dates} movies with invalid release dates")
-        #     movies = movies.dropna(subset=['release_year'])
 
         # Validate conversion
         logger.info(f"Release year range: {movies['release_year'].min()} - {movies['release_year'].max()}")
@@ -407,8 +388,8 @@ def train_or_load_models(ratings, user_features, item_features, force_retrain=Fa
             logger.error(f"Error in train_or_load_models: {str(e)}")
             raise
 
+# Helper function to train a single model with progress tracking
 def train_model_with_progress(model, interactions, name, **kwargs):
-    """Helper function to train a single model with progress tracking"""
     logger.info(f"Starting {name} training with interactions shape: {interactions.shape}")
     validate_interactions(interactions)
 
@@ -522,12 +503,6 @@ def train_models(ratings, user_features, item_features, n_folds=5):
             logger.error(f"Failed to build user features: {str(e)}")
             raise
         
-        # user_feature_list = [
-        #     (uid, {feature: value for feature, value in row.items() if value != 0})
-        #     for uid, row in user_features.iterrows()
-        # ]
-        # user_features_matrix = dataset.build_user_features(user_feature_list)
-        
         # Prepare item features
         logger.info("Building item features...")
         try:
@@ -540,12 +515,6 @@ def train_models(ratings, user_features, item_features, n_folds=5):
         except Exception as e:
             logger.error(f"Failed to build item features: {str(e)}")
             raise
-
-        # item_feature_list = [
-        #     (iid, {feature: value for feature, value in row.items() if value != 0})
-        #     for iid, row in item_features.iterrows()
-        # ]
-        # item_features_matrix = dataset.build_item_features(item_feature_list)
         
         # Initialize models
         base_model_cv = []
@@ -655,73 +624,6 @@ def train_models(ratings, user_features, item_features, n_folds=5):
         logger.error(f"Error in train_models: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
-        
-        # # Split data
-        # logger.info("Splitting into train/test sets...")
-        # train_interactions, test_interactions = train_test_split(interactions, test_size=0.2, random_state=42)
-        
-        # # Train models
-        # models = {
-        #     'model_base': LightFM(loss='warp', random_state=42),
-        #     'model_user': LightFM(loss='warp', random_state=42)
-        # }
-
-        # for name, model in models.items():
-        #     logger.info(f"Training {name}...")
-        #     try:
-        #         if name == 'model_base':
-        #             models[name] = train_model_with_progress(
-        #                 model,
-        #                 train_interactions,
-        #                 name,
-        #                 item_features=item_features_matrix,
-        #             )
-        #         else:  # model_user
-        #             models[name] = train_model_with_progress(
-        #                 model,
-        #                 train_interactions,
-        #                 name,
-        #                 user_features=user_features_matrix,
-        #                 item_features=item_features_matrix                        
-        #             )
-        #     except Exception as e:
-        #         logger.error(f"Failed to train {name}: {str(e)}")
-        #         raise
-
-        # logger.info("All models trained successfully")
-        # return models['model_base'], models['model_user'], dataset, test_interactions
-
-        # logger.info("Training model_32m...")
-        # validate_interactions(train_interactions)
-        # model_32m = train_model_with_progress(
-        #     LightFM(loss='warp'),
-        #     train_interactions,
-        #     "model_32m"
-        # )
-        
-        # logger.info("Training model_1m...")
-        # model_1m = train_model_with_progress(
-        #     LightFM(loss='warp'),
-        #     train_interactions,
-        #     "model_1m",
-        #     user_features=user_features_matrix
-        # )
-        
-        # logger.info("Training model_imdb...")
-        # model_imdb = train_model_with_progress(
-        #     LightFM(loss='warp'),
-        #     train_interactions,
-        #     "model_imdb",
-        #     item_features=item_features_matrix
-        # )
-
-        #logger.info("All models trained successfully")
-        #return model_32m, model_1m, model_imdb, dataset, test_interactions
-        
-    # except Exception as e:
-    #     logger.error(f"Error in train_models: {str(e)}")
-    #     logger.error(f"Stack trace: {traceback.format_exc()}")
-    #     raise
 
 def create_new_user_features(age: int, gender: str, favorite_imdb_ids: List[str], movies_df: pd.DataFrame, imdb_reviews: pd.DataFrame):
     try:
@@ -751,13 +653,6 @@ def create_new_user_features(age: int, gender: str, favorite_imdb_ids: List[str]
         }
         user_features = pd.concat([user_features, pd.get_dummies(user_features['age'].map(age_groups), prefix='age')], axis=1)
         user_features = pd.get_dummies(user_features, columns=['gender'])
-        
-        # # Add favorite movie genres
-        # all_genres = set(movies_df['genres'].str.split('|', expand=True).values.ravel())
-        # all_genres.discard(None)  # Remove None if present
-        
-        # for genre in all_genres:
-        #     user_features[f'genre_{genre}'] = 0
 
         # Get genre preferences from favorite movies
         favorite_movies = movies_df[movies_df['imdb_id'].isin(favorite_imdb_ids)]
@@ -781,10 +676,6 @@ def create_new_user_features(age: int, gender: str, favorite_imdb_ids: List[str]
         # Normalize genre features
         genre_columns = [col for col in user_features.columns if col.startswith('genre_')]
         user_features[genre_columns] = user_features[genre_columns] / len(favorite_movies)
-        
-        # # Add average sentiment of favorite movies
-        # favorite_movie_sentiments = imdb_reviews[imdb_reviews['Movie'].isin(favorite_movies)]['Review'].apply(lambda x: TextBlob(x).sentiment.polarity).mean()
-        # user_features['avg_sentiment'] = favorite_movie_sentiments
         
         logger.info("Successfully created new user features")
         return user_features
@@ -974,15 +865,6 @@ def main():
             if 'user_preferences' in exp:
                 print("User Preferences:", exp['user_preferences'])        
 
-        # recommendations = generate_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, movies)
-        # logger.info(f"Generated recommendations: {recommendations}")
-        # print("Recommendations for new user:", recommendations)
-        
-        # # Example: Explain a recommendation
-        # item_id = movies[movies['title'] == recommendations[0]].index[0]
-        # top_features = explain_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, item_id, item_features)
-        # print("Top features for recommendation:", top_features)
-
     except Exception as e:
         logger.error(f"Fatal error in main: {str(e)}")
         raise
@@ -993,10 +875,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Application failed: {str(e)}")
         raise
-
-## To integrate this with a GUI, you would:
-## Collect the new user's age, gender, and top 5 favorite movies through the GUI.
-## Pass this information to the create_new_user_features function.
-## Use the resulting user features to generate recommendations with the generate_recommendations function.
-## Display the recommendations in the GUI.
-## Optionally, use the explain_recommendations function to provide explanations for each recommendation.
