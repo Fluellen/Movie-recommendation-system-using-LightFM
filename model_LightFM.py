@@ -19,59 +19,9 @@ from typing import Tuple, List, Dict
 from tqdm.auto import tqdm
 from datetime import datetime
 
-# Save trained models and associated data
-def save_models(models, dataset, test_interactions):
-    save_dir = 'trained_models'
-    os.makedirs(save_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    # Save each model and dataset
-    model_files = {
-        'model_base': f'{save_dir}/model_base_{timestamp}.joblib',
-        'model_user': f'{save_dir}/model_user_{timestamp}.joblib',
-        'dataset': f'{save_dir}/dataset_{timestamp}.joblib',
-        'test_interactions': f'{save_dir}/test_interactions_{timestamp}.joblib'
-    }
-    
-    joblib.dump(models['model_base'], model_files['model_base'])
-    joblib.dump(models['model_user'], model_files['model_user'])
-    joblib.dump(dataset, model_files['dataset'])
-    joblib.dump(test_interactions, model_files['test_interactions'])
-    
-    # Save metadata
-    with open(f'{save_dir}/model_info_{timestamp}.txt', 'w') as f:
-        f.write(f"Models saved on: {timestamp}\n")
-        for name, path in model_files.items():
-            f.write(f"{name}: {path}\n")
-    
-    return model_files
-
-# Load most recent trained models
-def load_latest_models():
-    save_dir = 'trained_models'
-    if not os.path.exists(save_dir):
-        return None, None, None, None
-    
-    # Find latest timestamp
-    timestamps = []
-    for file in os.listdir(save_dir):
-        if file.startswith('model_base_'):
-            timestamp = file.split('_')[2].split('.')[0]
-            timestamps.append(timestamp)
-    
-    if not timestamps:
-        return None, None, None, None
-    
-    latest = max(timestamps)
-    
-    # Load models
-    model_base = joblib.load(f'{save_dir}/model_base_{latest}.joblib')
-    model_user = joblib.load(f'{save_dir}/model_user_{latest}.joblib')
-    dataset = joblib.load(f'{save_dir}/dataset_{latest}.joblib')
-    test_interactions = joblib.load(f'{save_dir}/test_interactions_{latest}.joblib')
-    
-    return model_base, model_user, dataset, test_interactions
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    logger.info(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
 # Configure logging
 logging.basicConfig(
@@ -82,16 +32,83 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
+
+# Returns dictionary of model file paths
+def get_model_paths():
+    save_dir = 'trained_models'
+    os.makedirs(save_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    return {
+        'model_base': f'{save_dir}/model_base_{timestamp}.joblib',
+        'model_user': f'{save_dir}/model_user_{timestamp}.joblib',
+        'dataset': f'{save_dir}/dataset_{timestamp}.joblib',
+        'test_interactions': f'{save_dir}/test_interactions_{timestamp}.joblib'
+    }
+
+# Save trained models and associated data
+def save_models(models, dataset, test_interactions):
+    try:
+        model_files = get_model_paths()
+
+        # Save models and data
+        joblib.dump(models['model_base'], model_files['model_base'])
+        joblib.dump(models['model_user'], model_files['model_user'])
+        joblib.dump(dataset, model_files['dataset'])
+        joblib.dump(test_interactions, model_files['test_interactions'])
+        
+        # Save cross-validation metadata if available
+        if 'cv_scores' in models:
+            metadata = {
+                'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
+                'cv_scores': models['cv_scores'],
+                'best_base_fold': models.get('best_base_fold'),
+                'best_user_fold': models.get('best_user_fold'),
+                'mean_auc': models.get('mean_auc')
+            }
+            joblib.dump(metadata, f"{os.path.dirname(model_files['model_base'])}/cv_metadata_{metadata['timestamp']}.joblib")
+        
+        logger.info("Models and metadata saved successfully")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error saving models: {str(e)}")
+        return False
+
+# Load most recent trained models
+def load_latest_models():
+    try:
+        save_dir = 'trained_models'
+        if not os.path.exists(save_dir):
+            return None, None, None
+        
+        # Find latest timestamp
+        files = os.listdir(save_dir)
+        if not files:
+            logger.warning("No model files found")
+            return None, None, None
+        
+        latest = max(files, key=lambda x: os.path.getctime(os.path.join(save_dir, x)))
+        timestamp = latest.split('_')[-1].replace('.joblib','')
+        
+        # Load models
+        models = {
+            'model_base': joblib.load(f'{save_dir}/model_base_{timestamp}.joblib'),
+            'model_user': joblib.load(f'{save_dir}/model_user_{timestamp}.joblib')
+        }
+        dataset = joblib.load(f'{save_dir}/dataset_{timestamp}.joblib')
+        test_interactions = joblib.load(f'{save_dir}/test_interactions_{timestamp}.joblib')
+        
+        logger.info(f"Loaded models from timestamp: {timestamp}")
+        return models, dataset, test_interactions
+    except Exception as e:
+        logger.error(f"Error loading models: {str(e)}")
+        return None, None, None
 
 class DatasetError(Exception):
     """Custom exception for dataset-related errors"""
     pass
-
-def log_memory_usage():
-    process = psutil.Process(os.getpid())
-    logger.info(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
 # Load and preprocess datasets
 def load_and_preprocess_data():
@@ -330,25 +347,36 @@ def validate_interactions(interactions):
     return True
 
 # Train new models or load existing ones
-def train_or_load_models(ratings, user_features, item_features, imdb_user_features, force_retrain=False):
-    if not force_retrain:
-        logger.info("Attempting to load existing models...")
-        models = load_latest_models()
-        if all(model is not None for model in models):
-            logger.info("Successfully loaded existing models")
-            return models
-    
-    logger.info("Training new models...")
-    models = train_models(ratings, user_features, item_features)
-    
-    # Save newly trained models
-    model_dict = {
-        'model_base': models[0],
-        'model_user': models[1]
-    }
-    save_models(model_dict, models[2], models[3])
-    
-    return models
+def train_or_load_models(ratings, user_features, item_features, force_retrain=False, n_folds=5):
+
+    save_success = False  # Initialize the variable
+
+    try:
+        if not force_retrain:
+            logger.info("Attempting to load existing models...")
+            models, dataset, test_interactions = load_latest_models()
+            if all(model is not None for model in models):
+                logger.info("Successfully loaded existing models")
+                return models, dataset, test_interactions
+        
+        logger.info("Training new models...")
+        models, dataset, test_interactions = train_models(
+            ratings=ratings, 
+            user_features=user_features, 
+            item_features=item_features,
+            n_folds=n_folds
+        )
+        
+        # Save newly trained models
+        save_success = save_models(models, dataset, test_interactions)
+        if not save_success:
+            logger.warning("Failed to save models, but training completed successfully")
+
+        return models, dataset, test_interactions
+        
+    except Exception as e:
+            logger.error(f"Error in train_or_load_models: {str(e)}")
+            raise
 
 def train_model_with_progress(model, interactions, name, **kwargs):
     """Helper function to train a single model with progress tracking"""
@@ -392,9 +420,9 @@ def train_model_with_progress(model, interactions, name, **kwargs):
         raise
 
 # Train models
-def train_models(ratings, user_features, item_features):
+def train_models(ratings, user_features, item_features, n_folds=5):
     try:
-        logger.info("Training recommendation models...")
+        logger.info("Training recommendation models with cross-validation...")
 
         # Create LightFM datasets
         user_features = user_features.dropna()
@@ -476,40 +504,142 @@ def train_models(ratings, user_features, item_features):
         # ]
         # item_features_matrix = dataset.build_item_features(item_feature_list)
         
-        # Split data
-        logger.info("Splitting into train/test sets...")
-        train_interactions, test_interactions = train_test_split(interactions, test_size=0.2, random_state=42)
+        # Initialize models
+        base_model_cv = []
+        user_model_cv = []
+
+        # Perform k-fold cross-validation
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        fold_indices = kf.split(np.arange(interactions.shape[0]))
+
+        for fold, (train_idx, test_idx) in enumerate(fold_indices):
+            logger.info(f"Training fold {fold+1}/{n_folds}")
+
+            # Split interactions
+            train = interactions[train_idx]
+            test = interactions[test_idx] 
+
+            # Train base model
+            base_model = LightFM(
+                loss='warp',
+                no_components=64,
+                learning_rate=0.05,
+                item_alpha=1e-6,
+                user_alpha=1e-6,
+                max_sampled=10,
+                learning_schedule='adagrad',
+                random_state=42
+            )
+            
+            # Train user model
+            user_model = LightFM(
+                loss='warp',
+                no_components=64,
+                learning_rate=0.05,
+                item_alpha=1e-6,
+                user_alpha=1e-6,
+                max_sampled=10,
+                learning_schedule='adagrad',
+                random_state=42
+            )
+
+            # Train models with early stopping
+            best_auc = 0
+            patience = 3
+            no_improvement = 0
+
+            for epoch in range(30):
+                base_model.fit_partial(
+                    train,
+                    item_features=item_features_matrix,
+                    epochs=1,
+                    num_threads=4
+                )
+                
+                user_model.fit_partial(
+                    train,
+                    user_features=user_features_matrix,
+                    item_features=item_features_matrix,
+                    epochs=1,
+                    num_threads=4
+                )
+
+                # Evaluate on test set
+                current_auc = np.mean([
+                    auc_score(base_model, test, item_features=item_features_matrix),
+                    auc_score(user_model, test, user_features=user_features_matrix, item_features=item_features_matrix)
+                ])
+                
+                if current_auc > best_auc:
+                    best_auc = current_auc
+                    no_improvement = 0
+                else:
+                    no_improvement += 1
+                
+                if no_improvement >= patience:
+                    logger.info(f"Early stopping at epoch {epoch}")
+                    break
+
+            base_model_cv.append(base_model)
+            user_model_cv.append(user_model)
+
+            logger.info(f"Fold {fold+1} AUC: {best_auc:.4f}")
+
+        # Select best models based on validation performance
+        best_base_idx = np.argmax([
+            auc_score(model, interactions, item_features=item_features_matrix).mean()
+            for model in base_model_cv
+        ])
+
+        best_user_idx = np.argmax([
+            auc_score(model, interactions, user_features=user_features_matrix, item_features=item_features_matrix).mean()
+            for model in user_model_cv
+        ])
+
+        return {
+            'model_base': base_model_cv[best_base_idx],
+            'model_user': user_model_cv[best_user_idx]
+        }, dataset, interactions
+    
+    except Exception as e:
+        logger.error(f"Error in train_models: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise
         
-        # Train models
-        models = {
-            'model_base': LightFM(loss='warp', random_state=42),
-            'model_user': LightFM(loss='warp', random_state=42)
-        }
+        # # Split data
+        # logger.info("Splitting into train/test sets...")
+        # train_interactions, test_interactions = train_test_split(interactions, test_size=0.2, random_state=42)
+        
+        # # Train models
+        # models = {
+        #     'model_base': LightFM(loss='warp', random_state=42),
+        #     'model_user': LightFM(loss='warp', random_state=42)
+        # }
 
-        for name, model in models.items():
-            logger.info(f"Training {name}...")
-            try:
-                if name == 'model_base':
-                    models[name] = train_model_with_progress(
-                        model,
-                        train_interactions,
-                        name,
-                        item_features=item_features_matrix,
-                    )
-                else:  # model_user
-                    models[name] = train_model_with_progress(
-                        model,
-                        train_interactions,
-                        name,
-                        user_features=user_features_matrix,
-                        item_features=item_features_matrix                        
-                    )
-            except Exception as e:
-                logger.error(f"Failed to train {name}: {str(e)}")
-                raise
+        # for name, model in models.items():
+        #     logger.info(f"Training {name}...")
+        #     try:
+        #         if name == 'model_base':
+        #             models[name] = train_model_with_progress(
+        #                 model,
+        #                 train_interactions,
+        #                 name,
+        #                 item_features=item_features_matrix,
+        #             )
+        #         else:  # model_user
+        #             models[name] = train_model_with_progress(
+        #                 model,
+        #                 train_interactions,
+        #                 name,
+        #                 user_features=user_features_matrix,
+        #                 item_features=item_features_matrix                        
+        #             )
+        #     except Exception as e:
+        #         logger.error(f"Failed to train {name}: {str(e)}")
+        #         raise
 
-        logger.info("All models trained successfully")
-        return models['model_base'], models['model_user'], dataset, test_interactions
+        # logger.info("All models trained successfully")
+        # return models['model_base'], models['model_user'], dataset, test_interactions
 
         # logger.info("Training model_32m...")
         # validate_interactions(train_interactions)
@@ -538,18 +668,18 @@ def train_models(ratings, user_features, item_features):
         #logger.info("All models trained successfully")
         #return model_32m, model_1m, model_imdb, dataset, test_interactions
         
-    except Exception as e:
-        logger.error(f"Error in train_models: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
-        raise
+    # except Exception as e:
+    #     logger.error(f"Error in train_models: {str(e)}")
+    #     logger.error(f"Stack trace: {traceback.format_exc()}")
+    #     raise
 
-def create_new_user_features(age: int, gender: str, favorite_movies: List[str], movies_df: pd.DataFrame, imdb_reviews: pd.DataFrame):
+def create_new_user_features(age: int, gender: str, favorite_imdb_ids: List[str], movies_df: pd.DataFrame, imdb_reviews: pd.DataFrame):
     try:
         if not isinstance(age, (int, float)) or age < 0 or age > 120:
             raise ValueError(f"Invalid age value: {age}")
         if gender not in ['M', 'F']:
             raise ValueError(f"Invalid gender value: {gender}")
-        if not favorite_movies or len(favorite_movies) == 0:
+        if not favorite_imdb_ids or len(favorite_imdb_ids) == 0:
             raise ValueError("No favorite movies provided")
             
         logger.info(f"Creating features for new user (age: {age}, gender: {gender})")
@@ -572,12 +702,20 @@ def create_new_user_features(age: int, gender: str, favorite_movies: List[str], 
         user_features = pd.concat([user_features, pd.get_dummies(user_features['age'].map(age_groups), prefix='age')], axis=1)
         user_features = pd.get_dummies(user_features, columns=['gender'])
         
-        # Add favorite movie genres
-        all_genres = set(movies_df['genres'].str.split('|', expand=True).values.ravel())
-        all_genres.discard(None)  # Remove None if present
+        # # Add favorite movie genres
+        # all_genres = set(movies_df['genres'].str.split('|', expand=True).values.ravel())
+        # all_genres.discard(None)  # Remove None if present
         
-        for genre in all_genres:
-            user_features[f'genre_{genre}'] = 0
+        # for genre in all_genres:
+        #     user_features[f'genre_{genre}'] = 0
+
+        # Get genre preferences from favorite movies
+        favorite_movies = movies_df[movies_df['imdb_id'].isin(favorite_imdb_ids)]
+
+        # Calculate genre preferences
+        genre_columns = [col for col in movies_df.columns if col.startswith('genre_')]
+        for col in genre_columns:
+            user_features[col] = favorite_movies[col].mean()
         
         for movie in favorite_movies:
             if movie in movies_df['title'].values:
@@ -585,13 +723,18 @@ def create_new_user_features(age: int, gender: str, favorite_movies: List[str], 
                 for genre in genres:
                     user_features[f'genre_{genre}'] += 1
         
+        # Add preferences based on IMDb reviews of favorite movies
+        favorite_reviews = imdb_reviews[imdb_reviews['imdb_id'].isin(favorite_imdb_ids)]
+        if not favorite_reviews.empty:
+            user_features['review_sentiment'] = favorite_reviews['sentiment'].mean()
+            
         # Normalize genre features
         genre_columns = [col for col in user_features.columns if col.startswith('genre_')]
         user_features[genre_columns] = user_features[genre_columns] / len(favorite_movies)
         
-        # Add average sentiment of favorite movies
-        favorite_movie_sentiments = imdb_reviews[imdb_reviews['Movie'].isin(favorite_movies)]['Review'].apply(lambda x: TextBlob(x).sentiment.polarity).mean()
-        user_features['avg_sentiment'] = favorite_movie_sentiments
+        # # Add average sentiment of favorite movies
+        # favorite_movie_sentiments = imdb_reviews[imdb_reviews['Movie'].isin(favorite_movies)]['Review'].apply(lambda x: TextBlob(x).sentiment.polarity).mean()
+        # user_features['avg_sentiment'] = favorite_movie_sentiments
         
         logger.info("Successfully created new user features")
         return user_features
@@ -600,28 +743,66 @@ def create_new_user_features(age: int, gender: str, favorite_movies: List[str], 
         logger.error(f"Error creating new user features: {str(e)}")
         raise
 
-def ensemble_predict(models, dataset, user_features, item_ids):
-    predictions = []
-    for model in models:
-        user_features_matrix = dataset.build_user_features(user_features.to_dict('records'), normalize=False)
-        pred = model.predict(0, item_ids, user_features=user_features_matrix)
-        predictions.append(pred)
-    return np.mean(predictions, axis=0)
+def ensemble_predict(user_ids, item_ids, dataset, model_base, model_user, user_features=None):
+    """Generate ensemble predictions for given user-item pairs"""
+    base_scores = model_base.predict(
+        user_ids=user_ids,
+        item_ids=item_ids,
+        item_features=dataset.build_item_features()
+    )
+    
+    user_scores = model_user.predict(
+        user_ids=user_ids,
+        item_ids=item_ids,
+        user_features=user_features,
+        item_features=dataset.build_item_features()
+    )
+    
+    return 0.4 * base_scores + 0.6 * user_scores
 
-def generate_recommendations(models, dataset, user_features, movies_df, n=10):
+def generate_recommendations(user_id, user_features, dataset, movies, model_base, model_user, n=10):
     try:
         if n <= 0:
             raise ValueError(f"Invalid number of recommendations requested: {n}")
             
         logger.info(f"Generating {n} recommendations...")
-        predictions = ensemble_predict(models, dataset, user_features, np.arange(len(movies_df)))
+
+        item_ids = np.arange(dataset.interactions_shape[1])
+
+        # Get predictions from both models
+        base_scores = model_base.predict(
+            user_ids=[user_id] * len(item_ids),
+            item_ids=item_ids,
+            item_features=dataset.build_item_features()
+        )
+
+        user_scores = model_user.predict(
+            user_ids=[user_id] * len(item_ids),
+            item_ids=item_ids,
+            user_features=user_features,
+            item_features=dataset.build_item_features()
+        )
         
-        if np.isnan(predictions).any():
-            raise ValueError("NaN values in predictions")
-            
-        top_items = np.arange(len(movies_df))[np.argsort(-predictions)][:n]
-        recommendations = movies_df.iloc[top_items]['title'].tolist()
-        
+        # Combine predictions (0.4 base + 0.6 user model)
+        ensemble_scores = 0.4 * base_scores + 0.6 * user_scores
+
+        # Get top N recommendations
+        top_items = item_ids[np.argsort(-ensemble_scores)][:n]
+        top_scores = ensemble_scores[np.argsort(-ensemble_scores)][:n]
+
+        # Get movie details
+        recommendations = []
+        for item_id, score in zip(top_items, top_scores):
+            movie = movies[movies['movieId'] == item_id].iloc[0]
+            recommendations.append({
+                'movieId': item_id,
+                'title': movie['title'],
+                'score': score,
+                'genres': movie['genres'],
+                'base_score': base_scores[item_id],
+                'user_score': user_scores[item_id]
+            })
+
         logger.info("Successfully generated recommendations")
         return recommendations
         
@@ -629,18 +810,40 @@ def generate_recommendations(models, dataset, user_features, movies_df, n=10):
         logger.error(f"Error generating recommendations: {str(e)}")
         raise
 
-def explain_recommendations(models, dataset, user_features, item_id, item_features):
-    feature_importances = []
-    for model in models:
-        user_features_matrix = dataset.build_user_features(user_features.to_dict('records'), normalize=False)
-        user_biases, user_factors = model.get_user_representations(user_features_matrix)
-        item_biases, item_factors = model.get_item_representations(item_features)
-        importance = user_factors[0].dot(item_factors[item_id].T)
-        feature_importances.append(importance)
+def explain_recommendations(recommendations, movies, dataset, model_base, model_user, user_features=None):
+    explanations = []
     
-    avg_importance = np.mean(feature_importances, axis=0)
-    top_features = np.argsort(-avg_importance)[:5]
-    return top_features
+    for rec in recommendations:
+        movie_id = rec['movieId']
+        movie = movies[movies['movieId'] == movie_id].iloc[0]
+        
+        explanation = {
+            'title': movie['title'],
+            'base_contribution': rec['base_score'] * 0.4,
+            'user_contribution': rec['user_score'] * 0.6,
+            'total_score': rec['score'],
+            'genres': movie['genres'],
+            'features': {}
+        }
+        
+        # Get feature contributions from both models
+        if user_features is not None:
+            user_biases = model_user.get_user_representations(user_features)[1]
+            explanation['user_preferences'] = {
+                feature: bias for feature, bias in zip(dataset.user_features, user_biases)
+                if abs(bias) > 0.1
+            }
+        
+        item_features = dataset.build_item_features()
+        item_biases = model_base.get_item_representations(item_features)[1]
+        explanation['item_features'] = {
+            feature: bias for feature, bias in zip(dataset.item_features, item_biases)
+            if abs(bias) > 0.1
+        }
+        
+        explanations.append(explanation)
+        
+    return explanations
 
 # Main function
 def main():
@@ -659,7 +862,7 @@ def main():
         print("NaN values in ratings:", ratings.isna().sum().sum())
         print("NaN values in user_features:", user_features.isna().sum().sum())
         print("NaN values in item_features:", item_features.isna().sum().sum())
-        print("NaN values in imdb_user_features:", imdb_user_features.isna().sum().sum())
+        #print("NaN values in imdb_user_features:", imdb_user_features.isna().sum().sum())
 
         # Before training, validate data
         if not all(isinstance(uid, (int, np.integer)) for uid in ratings['userId']):
@@ -670,30 +873,65 @@ def main():
             
         if not ratings['rating'].between(1, 5).all():
             raise ValueError("All ratings must be between 1 and 5")
-        
-        # Train models
-        #model_32m, model_1m, model_imdb, dataset, test_interactions = train_models(ratings, user_features, item_features, imdb_user_features)
-        model_base, model_user, dataset, test_interactions = train_or_load_models(
-            ratings, 
-            user_features, 
-            item_features,
-            force_retrain=False  # Set to True to force retraining
+
+        models, dataset, test_interactions = train_or_load_models(
+            ratings=ratings,
+            user_features=user_features, 
+            item_features=item_features,
+            force_retrain=True,
+            n_folds=5
         )
+
+        model_base = models['model_base']
+        model_user = models['model_user']
+        
         # Example: Generate recommendations for a new user
-        new_user_age = 30
-        new_user_gender = 'M'
-        new_user_favorite_movies = ['The Shawshank Redemption', 'The Godfather', 'The Dark Knight', 'Pulp Fiction', 'Forrest Gump']
+        new_user_features = create_new_user_features(
+            age=25,
+            gender='M',
+            favorite_imdb_ids=['0166924', '0068646', '0110912', '0099685', '0172495'], # Mulholland Drive, 'The Godfather', 'Pulp Fiction', 'Godfellas', 'Gladiator'
+            movies_df=movies, 
+            imdb_reviews=imdb_reviews
+        )
         
-        new_user_features = create_new_user_features(new_user_age, new_user_gender, new_user_favorite_movies, movies, imdb_reviews)
+        # Generate recommendations
+        recommendations = generate_recommendations(
+            user_id=999999,  # new user ID
+            user_features=new_user_features,
+            dataset=dataset,
+            movies=movies,
+            model_base=model_base,
+            model_user=model_user,
+            n=10
+        )
+
+        # Get explanations
+        explanations = explain_recommendations(
+            recommendations=recommendations,
+            movies=movies,
+            dataset=dataset,
+            model_base=model_base,
+            model_user=model_user,
+            user_features=new_user_features
+        )
+
+        for rec, exp in zip(recommendations, explanations):
+            print(f"\nMovie: {rec['title']}")
+            print(f"Total Score: {rec['score']:.3f}")
+            print(f"Base Model Contribution: {exp['base_contribution']:.3f}")
+            print(f"User Model Contribution: {exp['user_contribution']:.3f}")
+            print("Genre Match:", exp['genres'])
+            if 'user_preferences' in exp:
+                print("User Preferences:", exp['user_preferences'])        
+
+        # recommendations = generate_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, movies)
+        # logger.info(f"Generated recommendations: {recommendations}")
+        # print("Recommendations for new user:", recommendations)
         
-        recommendations = generate_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, movies)
-        logger.info(f"Generated recommendations: {recommendations}")
-        print("Recommendations for new user:", recommendations)
-        
-        # Example: Explain a recommendation
-        item_id = movies[movies['title'] == recommendations[0]].index[0]
-        top_features = explain_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, item_id, item_features)
-        print("Top features for recommendation:", top_features)
+        # # Example: Explain a recommendation
+        # item_id = movies[movies['title'] == recommendations[0]].index[0]
+        # top_features = explain_recommendations([model_32m, model_1m, model_imdb], dataset, new_user_features, item_id, item_features)
+        # print("Top features for recommendation:", top_features)
 
     except Exception as e:
         logger.error(f"Fatal error in main: {str(e)}")
@@ -705,7 +943,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Application failed: {str(e)}")
         raise
-
 
 ## To integrate this with a GUI, you would:
 ## Collect the new user's age, gender, and top 5 favorite movies through the GUI.
